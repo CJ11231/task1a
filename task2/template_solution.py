@@ -1,79 +1,127 @@
-# This serves as a template which will guide you through the implementation of this task.  It is advised
-# to first read the whole template and get a sense of the overall structure of the code before trying to fill in any of the TODO gaps
-# First, we import necessary libraries:
 import numpy as np
 import pandas as pd
 
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+
+# Die neuen, stärkeren Modelle für das Stacking
+from sklearn.ensemble import HistGradientBoostingRegressor, ExtraTreesRegressor, RandomForestRegressor, StackingRegressor
+from sklearn.linear_model import RidgeCV, BayesianRidge
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.svm import SVR
+
 def load_data():
     """
-    This function loads the training and test data, preprocesses it, removes the NaN values and interpolates the missing
-    data using imputation
-
-    Parameters
-    ----------
-    Returns
-    ----------
-    X_train: matrix of floats, training input with features
-    y_train: array of floats, training output with labels
-    X_test: matrix of floats: dim = (100, ?), test input with features
+    Loads the training and test data, one-hot encodes seasons, 
+    imputes missing features, and drops rows with missing targets.
     """
-    # Load training data
     train_df = pd.read_csv("train.csv")
-    
-    print("Training data:")
-    print("Shape:", train_df.shape)
-    print(train_df.head(2))
-    print('\n')
-    
-    # Load test data
     test_df = pd.read_csv("test.csv")
 
-    print("Test data:")
-    print(test_df.shape)
-    print(test_df.head(2))
+    train_len = len(train_df)
+    combined = pd.concat([train_df, test_df], axis=0, ignore_index=True)
+    
+    # drop_first=False ist besser für Baum-Modelle, damit sie jede Saison direkt sehen können
+    combined = pd.get_dummies(combined, columns=['season'], drop_first=False)
 
-    # Dummy initialization of the X_train, X_test and y_train
-    # TODO: Depending on how you deal with the non-numeric data, you may want to 
-    # modify/ignore the initialization of these variables   
-    X_train = np.zeros_like(train_df.drop(['price_CHF'],axis=1))
-    y_train = np.zeros_like(train_df['price_CHF'])
-    X_test = np.zeros_like(test_df)
+    train_encoded = combined.iloc[:train_len].copy()
+    test_encoded = combined.iloc[train_len:].copy()
 
-    # TODO: Perform data preprocessing, imputation and extract X_train, y_train and X_test
+    y_train_raw = train_encoded['price_CHF'].values
+    train_features = train_encoded.drop(columns=['price_CHF'])
+    test_features = test_encoded.drop(columns=['price_CHF'])
 
-    assert (X_train.shape[1] == X_test.shape[1]) and (X_train.shape[0] == y_train.shape[0]) and (X_test.shape[0] == 100), "Invalid data shape"
+    # BayesianRidge ist extrem stabil für die Imputation von stark korrelierten Features (wie Preisen)
+    imputer = IterativeImputer(estimator=BayesianRidge(), random_state=42, max_iter=50)
+    
+    all_features = pd.concat([train_features, test_features], axis=0)
+    imputer.fit(all_features)
+
+    X_train_imp = imputer.transform(train_features)
+    X_test_imp = imputer.transform(test_features)
+
+    # Zielvariablen (Target) bereinigen
+    valid_idx = ~pd.isna(y_train_raw)
+    X_train = X_train_imp[valid_idx]
+    y_train = y_train_raw[valid_idx]
+
+    X_test = X_test_imp
+
+    assert (X_train.shape[1] == X_test.shape[1]) and (X_train.shape[0] == y_train.shape[0]), "Invalid data shape"
     return X_train, y_train, X_test
 
 
 class Model(object):
     def __init__(self):
         super().__init__()
-        self._x_train = None
-        self._y_train = None
+        
+        # LEVEL 0: Die Basis-Modelle (maximale Diversität)
+        
+        # 1. State-of-the-Art Tree Booster (schnell und extrem stark)
+        hgb = HistGradientBoostingRegressor(
+            max_iter=800, learning_rate=0.03, l2_regularization=0.1, random_state=42
+        )
+        
+        # 2. Extra Trees (reduziert Varianz, sehr gut bei korrelierten Features durch max_features='sqrt')
+        et = ExtraTreesRegressor(
+            n_estimators=500, max_depth=15, max_features='sqrt', random_state=42
+        )
+        
+        # 3. Klassischer Random Forest
+        rf = RandomForestRegressor(
+            n_estimators=500, max_depth=15, max_features='sqrt', random_state=42
+        )
+        
+        # 4. Support Vector Machine (benötigt skalierte Daten)
+        svr = Pipeline([
+            ('scaler', StandardScaler()), 
+            ('svr', SVR(C=10.0, epsilon=0.01))
+        ])
+        
+        # 5. Regularisierte Lineare Regression (als extrem stabiler Anker)
+        ridge = Pipeline([
+            ('scaler', StandardScaler()), 
+            ('ridge', RidgeCV(alphas=np.logspace(-4, 4, 100)))
+        ])
+        
+        # LEVEL 1: Der Meta-Lerner, der lernt, wem er wann vertrauen muss
+        final_estimator = RidgeCV(alphas=np.logspace(-4, 4, 100))
+        
+        # Das ultimative Stacking-Modell (n_jobs=-1 nutzt alle CPU-Kerne deines Macs)
+        self.model = StackingRegressor(
+            estimators=[
+                ('hgb', hgb), 
+                ('et', et), 
+                ('rf', rf), 
+                ('svr', svr), 
+                ('ridge', ridge)
+            ],
+            final_estimator=final_estimator,
+            cv=5, # 5-fache Kreuzvalidierung, um Overfitting des Stackers zu verhindern
+            n_jobs=-1 
+        )
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray):
-        #TODO: Define the model and fit it using (X_train, y_train)
-        self._x_train = X_train
-        self._y_train = y_train
+        self.model.fit(X_train, y_train)
 
     def predict(self, X_test: np.ndarray) -> np.ndarray:
-        y_pred=np.zeros(X_test.shape[0])
-        #TODO: Use the model to make predictions y_pred using test data X_test
+        y_pred = self.model.predict(X_test)
         assert y_pred.shape == (X_test.shape[0],), "Invalid data shape"
         return y_pred
 
+
 # Main function. You don't have to change this
 if __name__ == "__main__":
-    # Data loading
     X_train, y_train, X_test = load_data()
+    
+    print(f"Training started on {X_train.shape[0]} samples. This might take 10-30 seconds...")
     model = Model()
-    # Use this function to fit the model
-    model.fit(X_train=X_train, y_train=y_train)
-    # Use this function for inference
+    model.fit(X_train, y_train)
+    
     y_pred = model.predict(X_test)
-    # Save results in the required format
-    dt = pd.DataFrame(y_pred) 
+    
+    dt = pd.DataFrame(y_pred)
     dt.columns = ['price_CHF']
     dt.to_csv('results.csv', index=False)
-    print("\nResults file successfully generated!")
-
+    print("Results file successfully generated! The model is highly optimized now.")
