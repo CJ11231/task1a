@@ -121,7 +121,7 @@ def training(train_data_input, train_data_label, **kwargs):
     dataset = TensorDataset(train_data_input, train_data_label)
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    n_epochs = 100
+    n_epochs = 30
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     for epoch in range(n_epochs):
